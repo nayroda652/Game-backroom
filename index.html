@@ -2770,6 +2770,8 @@
                     lastFire: 0,
                     respawnAt: 0,
                     dead: !!data.dead,
+                    respawnGraceUntil: 0,
+                    respawnAnchor: new THREE.Vector3(data.x !== undefined ? data.x : sp.x, 0, data.z !== undefined ? data.z : sp.z),
                     hidden: !!data.hidden,
                     rig: null
                 };
@@ -2789,20 +2791,50 @@
                 }
                 if (data.skin && normalizeSkin(data.skin) !== ent.skin) rebuildEntityRig(ent, normalizeSkin(data.skin));
                 ent.kills = data.kills !== undefined ? data.kills : ent.kills;
-                if (data.x !== undefined && data.z !== undefined) {
-                    ent.targetPos.set(data.x, data.y !== undefined ? Math.max(0, data.y - 1.7) : 0, data.z);
+                const incomingHasPosition = data.x !== undefined && data.z !== undefined &&
+                    Number.isFinite(Number(data.x)) && Number.isFinite(Number(data.z));
+                const incomingPos = incomingHasPosition
+                    ? new THREE.Vector3(
+                        Number(data.x),
+                        data.y !== undefined ? Math.max(0, Number(data.y) - 1.7) : 0,
+                        Number(data.z)
+                    )
+                    : null;
+                const updateNow = performance.now();
+                const wasDead = ent.dead;
+                const incomingDead = data.dead !== undefined ? !!data.dead : ent.dead;
+                const isRespawnUpdate = incomingPos && !incomingDead && (
+                    wasDead || ent.targetPos.distanceTo(incomingPos) > 20
+                );
+                const inRespawnGrace = updateNow < (ent.respawnGraceUntil || 0);
+                const stalePositionDuringGrace = inRespawnGrace && incomingPos &&
+                    ent.respawnAnchor && incomingPos.distanceTo(ent.respawnAnchor) > 14;
+                const staleDeathDuringGrace = inRespawnGrace && data.dead === true;
+
+                // Ignore late pre-respawn snapshots for a short period after a respawn snap.
+                if (!staleDeathDuringGrace && !stalePositionDuringGrace && incomingPos) {
+                    if (isRespawnUpdate) {
+                        ent.pos.copy(incomingPos);
+                        ent.targetPos.copy(incomingPos);
+                        ent.respawnAnchor.copy(incomingPos);
+                        ent.respawnGraceUntil = updateNow + 1400;
+                        ent.walkPhase = 0;
+                        ent.rig.root.position.copy(ent.pos);
+                    } else {
+                        ent.targetPos.copy(incomingPos);
+                    }
                 }
-                if (data.yaw !== undefined) ent.targetYaw = data.yaw;
+                if (data.yaw !== undefined && !staleDeathDuringGrace) ent.targetYaw = data.yaw;
                 if (data.weapon && data.weapon !== ent.weapon) {
                     ent.weapon = data.weapon;
                     setEntityHeldWeapon(ent, data.weapon);
                 }
-                if (data.hp !== undefined) ent.hp = data.hp;
+                if (data.hp !== undefined && !staleDeathDuringGrace) ent.hp = data.hp;
                 if (data.hidden !== undefined) {
                     ent.hidden = !!data.hidden;
                     ent.rig.root.visible = !ent.hidden;
                 }
-                if (data.dead !== undefined && data.dead !== ent.dead) {
+                if (data.dead !== undefined && !staleDeathDuringGrace && data.dead !== ent.dead) {
                     setEntitySupineDeathState(ent, data.dead);
                 }
             }
@@ -3154,8 +3186,15 @@
 
         function respawnPlayer() {
             const sp = selectSafestSpawnPoint(state.playerId);
-            state.pos.set(sp.x, 1.7, sp.z);
+
+            // Reset local motion state before publishing the new spawn position.
+            state.moveInput = { x: 0, z: 0 };
             state.velY = 0;
+            state.onGround = true;
+            state.headBobY = 0;
+            state.headBobRoll = 0;
+            state.walkBob = 0;
+            state.pos.set(sp.x, 1.7, sp.z);
             state.hp = state.maxHp;
             state.isDead = false;
             state.isHiddenInManhole = false;
@@ -3170,6 +3209,19 @@
             updateHealButtonUI();
             updateCenterActionTimer();
             updateHUD();
+            // Clear stale local room cache first, then publish the client spawn.
+            if (localRoomState && localRoomState.players) {
+                localRoomState.players[state.playerId] = {
+                    ...(localRoomState.players[state.playerId] || {}),
+                    id: state.playerId,
+                    dead: false,
+                    hidden: false,
+                    x: Number(state.pos.x.toFixed(2)),
+                    y: Number(state.pos.y.toFixed(2)),
+                    z: Number(state.pos.z.toFixed(2)),
+                    yaw: Number(state.yaw.toFixed(3))
+                };
+            }
             syncMyPlayerStateToNetwork(true);
         }
 
@@ -5044,7 +5096,10 @@
                 }
 
                 ent.rig.root.position.copy(ent.pos);
-                ent.rig.root.rotation.y = ent.yaw;
+                // Camera FPS looks along -Z at yaw=0, while the character rig's
+                // front is built along +Z. Apply a 180-degree visual offset for
+                // human players so their model faces the direction they look.
+                ent.rig.root.rotation.y = ent.isBot ? ent.yaw : ent.yaw + Math.PI;
             });
 
             // Cap nhat luu dan: pham vi no 50 don vi, sat thuong toi thieu >= 190, nguoi nem chiu 50% sat thuong
