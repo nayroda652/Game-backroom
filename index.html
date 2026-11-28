@@ -278,7 +278,7 @@
             <div class="flex flex-wrap items-center justify-between gap-2 pb-1.5 mb-1.5 border-b border-white/10 shrink-0">
                 <div class="flex items-center gap-2">
                     <div>
-                        <div class="text-[9px] font-bold uppercase tracking-widest text-amber-400">PHONG CHO TRUC TUYEN P2P</div>
+                        <div class="text-[9px] font-bold uppercase tracking-widest text-amber-400">PHONG CHO TRUC TUYEN - KET NOI SERVER</div>
                         <div class="text-sm font-black text-white tracking-wider">ID: <span id="waiting-room-code" class="text-amber-300">0000000</span></div>
                     </div>
                     <button id="btn-copy-room" class="px-2 py-1 rounded-lg bg-amber-500/20 border border-amber-400/40 text-amber-200 text-[9px] font-extrabold tracking-wider active:scale-95 transition">
@@ -1030,6 +1030,7 @@
         const state = {
             inGame: false,
             inWaitingRoom: false,
+            isQuickMatch: false,
             isHost: false,
             roomId: '',
             playerId: 'p_' + Math.random().toString(36).substring(2, 9),
@@ -2729,10 +2730,45 @@
             tex.needsUpdate = true;
         }
 
+        function disposeObject3D(root) {
+            if (!root) return;
+            root.traverse(obj => {
+                if (obj.geometry && obj.geometry.dispose) obj.geometry.dispose();
+                if (obj.material) {
+                    const materials = Array.isArray(obj.material) ? obj.material : [obj.material];
+                    materials.forEach(mat => {
+                        if (mat.map && mat.map.dispose) mat.map.dispose();
+                        if (mat.dispose) mat.dispose();
+                    });
+                }
+            });
+        }
+
         function clearAllEntities() {
-            entities.forEach(e => entitiesGroup.remove(e.rig.root));
+            entities.forEach(e => {
+                entitiesGroup.remove(e.rig.root);
+                disposeObject3D(e.rig.root);
+            });
             entities = [];
             entityHitMeshes.length = 0;
+        }
+
+        function clearMatchTransientEffects() {
+            grenades.forEach(g => {
+                entitiesGroup.remove(g.mesh);
+                disposeObject3D(g.mesh);
+            });
+            grenades.length = 0;
+            explosionEffects.forEach(fx => {
+                entitiesGroup.remove(fx.group);
+                disposeObject3D(fx.group);
+            });
+            explosionEffects.length = 0;
+            tracers.forEach(t => {
+                scene.remove(t.line);
+                disposeObject3D(t.line);
+            });
+            tracers.length = 0;
         }
 
         function rebuildEntityRig(ent, skin) {
@@ -4435,6 +4471,7 @@
         }
 
         function createOrJoinRoom(roomId, isHost, autoStart = false) {
+            state.isQuickMatch = false;
             if (state.selectedLoadout.length !== 3) state.selectedLoadout = ['ar', 'smg', 'sniper'];
             const cleanId = String(roomId).replace(/[^0-9]/g, '').slice(0, 7);
             if (!cleanId) return;
@@ -4474,6 +4511,49 @@
                 const hintEl = document.getElementById('waiting-net-hint');
                 if (hintEl) hintEl.textContent = 'Dang ket noi den phong ' + cleanId + '...';
             }
+        }
+
+        function startQuickMatchOffline() {
+            // Quick Match runs locally: clear room context before cleanup so no leave packet is sent.
+            state.isQuickMatch = true;
+            state.roomId = '';
+            destroyNetworkConnections();
+            state.isHost = true; // enables the existing local bot simulation only
+            state.playerName = getSanitizedName();
+            state.inWaitingRoom = false;
+            state.inGame = true;
+            const botPlayers = {};
+            const available = spawnPoints.map(p => p.clone());
+            // Shuffle safe map spawn points and choose spaced positions to avoid bot stacking.
+            for (let i = available.length - 1; i > 0; i--) {
+                const j = Math.floor(Math.random() * (i + 1));
+                [available[i], available[j]] = [available[j], available[i]];
+            }
+            const chosen = [];
+            for (const point of available) {
+                if (chosen.every(other => Math.hypot(point.x - other.x, point.z - other.z) >= 4.5)) {
+                    chosen.push(point);
+                    if (chosen.length === 15) break;
+                }
+            }
+            // If the map has fewer widely separated spawn points, fill with safest available points.
+            while (chosen.length < 15) {
+                const fallback = selectSafestSpawnPoint();
+                if (!chosen.some(other => other.distanceTo(fallback) < 2.5)) chosen.push(fallback);
+                else if (chosen.length < 15) {
+                    const candidate = available.find(point => !chosen.some(other => other.distanceTo(point) < 1.5));
+                    if (candidate) chosen.push(candidate.clone());
+                    else chosen.push(fallback);
+                }
+            }
+            for (let i = 0; i < 15; i++) {
+                const name = DEFAULT_BOTS[i % DEFAULT_BOTS.length] + (i >= DEFAULT_BOTS.length ? '_' + (i + 1) : '');
+                botPlayers['quick_bot_' + (i + 1)] = {
+                    id: 'quick_bot_' + (i + 1), name, isBot: true, hp: 200, kills: 0,
+                    dead: false, hidden: false, weapon: 'ar', x: chosen[i].x, y: 1.7, z: chosen[i].z
+                };
+            }
+            enterBattlefield({ players: botPlayers });
         }
 
         function enterBattlefield(roomData) {
@@ -4537,7 +4617,7 @@
                 if (exitBtn) exitBtn.classList.remove('hidden');
             }
 
-            document.getElementById('settings-room-id').textContent = state.roomId || '---';
+            document.getElementById('settings-room-id').textContent = state.isQuickMatch ? 'OFFLINE' : (state.roomId || '---');
             const totalPlayers = entities.length + 1;
             document.getElementById('settings-player-count').textContent = `${totalPlayers} / 20 NGUOI`;
 
@@ -4675,6 +4755,10 @@
         document.getElementById('btn-confirm-enter-match').addEventListener('click', () => {
             if (state.selectedLoadout.length !== 3) return;
             localStorage.setItem('nayroda_loadout', JSON.stringify(state.selectedLoadout));
+            if (state.pendingFlowMode === 'quick') {
+                startQuickMatchOffline();
+                return;
+            }
             const code = generate7DigitRoomId();
             createOrJoinRoom(code, true, true);
         });
@@ -4757,6 +4841,11 @@
             state.isHiddenInManhole = false;
             state.isOpeningChest = false;
             localRoomState = null;
+            state.isQuickMatch = false;
+            state.isHost = false;
+            state.roomId = '';
+            clearAllEntities();
+            clearMatchTransientEffects();
             setSniperScope(false);
             clearKillFeed();
             destroyNetworkConnections();
@@ -4968,22 +5057,26 @@
                 }
 
                 if (ent.isBot && state.isHost) {
+                    // Bots may target the local human or remote human players only.
+                    // AI entities are deliberately excluded from target selection and damage.
                     let targetPos = state.pos;
                     let targetIsHidden = state.isHiddenInManhole;
                     let targetDist = (!state.isDead && !targetIsHidden) ? ent.pos.distanceTo(state.pos) : Infinity;
                     let targetEntityObj = null;
 
-                    entities.forEach((other) => {
-                        if (other !== ent && !other.dead && !other.hidden) {
-                            const d = ent.pos.distanceTo(other.pos);
-                            if (d < targetDist) {
-                                targetDist = d;
-                                targetPos = other.pos;
-                                targetIsHidden = false;
-                                targetEntityObj = other;
+                    if (!state.isQuickMatch) {
+                        entities.forEach((other) => {
+                            if (other !== ent && !other.isBot && !other.dead && !other.hidden) {
+                                const d = ent.pos.distanceTo(other.pos);
+                                if (d < targetDist) {
+                                    targetDist = d;
+                                    targetPos = other.pos;
+                                    targetIsHidden = false;
+                                    targetEntityObj = other;
+                                }
                             }
-                        }
-                    });
+                        });
+                    }
 
                     let botMoving = false;
                     if (targetDist < 42) {
@@ -5034,23 +5127,14 @@
                                         } else {
                                             damagePlayer(14, ent.name, ent.id);
                                         }
-                                    } else if (!targetEntityObj.isBot && state.roomId) {
+                                    } else if (targetEntityObj && !targetEntityObj.isBot && state.roomId) {
                                         sendNetworkPacket({
                                             type: 'bot_damage',
                                             botId: ent.id,
                                             targetId: targetEntityObj.id,
                                             amount: 16
                                         });
-                                    } else {
-                                        targetEntityObj.hp -= 16;
-                                        if (targetEntityObj.hp <= 0) {
-                                            targetEntityObj.hp = 0;
-                                            targetEntityObj.respawnAt = now + 5000;
-                                            setEntitySupineDeathState(targetEntityObj, true);
-                                            ent.kills += 1;
-                                            pushKillFeed(ent.name, targetEntityObj.name, true);
-                                        }
-                                    }
+                                    } // Never let bot AI damage another AI entity.
                                 }
                             }
                         }
